@@ -36,6 +36,7 @@ DEFAULT_HISTORY = ROOT / "Lunch_Master_Data_FINAL(cleaned).xlsx"
 COUNTERS = ["North Non Veg", "North Veg", "South Non Veg", "South Veg"]
 WEEKDAY_LEVELS = ["Friday", "Monday", "Thursday", "Tuesday", "Wednesday"]
 DAY_TYPES = ["Regular", "Previous Day of Holiday", "Next Day of Holiday"]
+JUNE_TEST_START = pd.Timestamp("2026-06-01")
 
 # SmartQ brand (Brand Guideline 09/2022): yellow FCC529, blue 155493,
 # cyan 3F99A8, orange ED6940, dark gray 333333, Poppins typography.
@@ -269,6 +270,47 @@ def run_forecast(hist: pd.DataFrame, plan: pd.DataFrame) -> pd.DataFrame:
     return target.sort_values(["Date", "pred"], ascending=[True, False])
 
 
+@st.cache_data(show_spinner=False)
+def june_holdout_backtest(all_history: pd.DataFrame) -> pd.DataFrame:
+    """Sequential June test: predict each day, then add that day's actuals.
+
+    The model starts with only Aug 2025-May 2026 history. For every June date,
+    the actual menu is used as the known plan, but target-side columns are
+    zeroed by run_forecast(). After recording prediction vs actual for that
+    date, the actual item rows are appended before scoring the next working
+    day so lag-1 and rolling features have the latest true consumption.
+    """
+    train_hist = all_history[all_history["Date"] < JUNE_TEST_START].copy()
+    june_actual = all_history[all_history["Date"] >= JUNE_TEST_START].copy()
+    if train_hist.empty or june_actual.empty:
+        return pd.DataFrame()
+
+    available_hist = train_hist.copy()
+    rows = []
+    for dt in sorted(june_actual["Date"].unique()):
+        day_actual = june_actual[june_actual["Date"] == dt].copy()
+        plan_cols = ["Date", "Counter Name", "Item Name", "Category", "Day Type", "Panchangam"]
+        forecast = run_forecast(available_hist, day_actual[plan_cols])
+        actual_counter = (
+            day_actual.groupby(["Date", "Counter Name"], as_index=False)
+            .agg(actual=("Counter Consumed", "first"))
+        )
+        scored = forecast.merge(actual_counter, on=["Date", "Counter Name"], how="left")
+        scored["difference"] = scored["pred"] - scored["actual"]
+        scored["difference_pct"] = np.where(
+            scored["actual"].ne(0),
+            100 * scored["difference"] / scored["actual"],
+            np.nan,
+        )
+        rows.append(scored)
+        # Critical for lag-1 correctness: once the day is over, its true
+        # counter consumption becomes available before the next prediction.
+        available_hist = pd.concat([available_hist, day_actual], ignore_index=True)
+
+    out = pd.concat(rows, ignore_index=True)
+    return out.sort_values(["Date", "Counter Name"]).reset_index(drop=True)
+
+
 def base_layout(fig: go.Figure, height=380, **kw):
     fig.update_layout(
         height=height,
@@ -312,16 +354,19 @@ with st.sidebar:
              "is rebuilt from it.",
     )
     try:
-        hist = load_history(up_hist.getvalue() if up_hist else None)
+        all_hist = load_history(up_hist.getvalue() if up_hist else None)
     except Exception as e:  # bad upload → fall back loudly
         st.error(f"Could not read that workbook: {e}")
-        hist = load_history(None)
+        all_hist = load_history(None)
 
+    hist = all_hist[all_hist["Date"] < JUNE_TEST_START].copy()
+    june_hist = all_hist[all_hist["Date"] >= JUNE_TEST_START].copy()
     last_day = hist["Date"].max()
     st.markdown(
         f'<div class="sq-note">History loaded ✓<br>'
         f'<b>{hist["Date"].min():%d %b %Y} → {last_day:%d %b %Y}</b><br>'
-        f'{hist.shape[0]:,} item rows · {hist["Date"].nunique()} working days</div>',
+        f'{hist.shape[0]:,} item rows · {hist["Date"].nunique()} working days<br>'
+        f'June holdout: {june_hist["Date"].nunique()} working days excluded from history</div>',
         unsafe_allow_html=True)
     if not MVP_MODE:  # sidebar model-stats blurb — disabled in the MVP
         st.divider()
@@ -554,6 +599,45 @@ with tab_fc:
                                full_out.to_csv(index=False).encode(),
                                file_name="predictions_out.csv", mime="text/csv",
                                use_container_width=True)
+
+            june_bt = june_holdout_backtest(all_hist)
+            if not june_bt.empty:
+                st.divider()
+                st.subheader("June 2026 holdout check")
+                st.caption("History is capped at 31 May 2026. Each June day is predicted, "
+                           "then that day's actual consumption is added before the next "
+                           "day so lag-1/rolling features stay valid.")
+                bt_view = june_bt[[
+                    "Date", "Counter Name", "pred", "actual", "difference",
+                    "difference_pct", "lo", "hi", "order", "risk",
+                ]].copy()
+                bt_view.columns = [
+                    "Date", "Counter", "Predicted", "Actual",
+                    "Difference", "Difference %", "P10", "P90",
+                    "Suggested order", "Risk",
+                ]
+                bt_view["Date"] = pd.to_datetime(bt_view["Date"]).dt.date
+                for c in ["Predicted", "Actual", "Difference", "P10", "P90", "Suggested order"]:
+                    bt_view[c] = bt_view[c].round(0).astype(int)
+                bt_view["Difference %"] = bt_view["Difference %"].round(1)
+
+                total_actual = june_bt["actual"].sum()
+                total_abs_diff = june_bt["difference"].abs().sum()
+                wape = 100 * total_abs_diff / total_actual if total_actual else np.nan
+                bias = june_bt["difference"].mean()
+                m1, m2, m3 = st.columns(3)
+                m1.metric("June holdout WAPE", f"{wape:.2f}%")
+                m2.metric("Mean predicted − actual", f"{bias:+.1f} plates")
+                m3.metric("Counter-days scored", f"{len(june_bt)}")
+
+                st.dataframe(bt_view, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇️ Download june_holdout_predictions.csv",
+                    bt_view.to_csv(index=False).encode(),
+                    file_name="june_holdout_predictions.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
         else:
             day_keys = sorted(fc["Date"].unique())
             for dt in day_keys:
